@@ -1,45 +1,49 @@
 #!/usr/bin/env python3
 """
-yt_transcribe.py — download audio from a YouTube URL with yt-dlp and transcribe it.
+yt_transcribe.py — download audio from a YouTube URL with yt-dlp and transcribe it
+via the OpenAI Whisper API (model `whisper-1`). No local GPU/CPU inference.
 
 Usage:
-    python yt_transcribe.py URL [URL ...] [options]
-
-Examples:
-    # simplest: download + transcribe with default model (small)
+    # simplest: download + transcribe with the default API model (whisper-1)
     python yt_transcribe.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-    # pick a larger model, force English, write everything into ./out
-    python yt_transcribe.py URL --model medium --language en --output-dir ./out
+    # pick audio format, force a language, write to ./out
+    python yt_transcribe.py URL --audio-format mp3 --language en --output-dir ./out
 
     # only download, skip transcription (handy for batch collection)
     python yt_transcribe.py URL --skip-transcribe
 
     # transcribe an audio file you already have
-    python yt_transcribe.py --local-file podcast.mp3 --model medium
+    python yt_transcribe.py --local-file podcast.mp3 --language en
+
+Requirements:
+    export OPENAI_API_KEY="sk-..."    # https://platform.openai.com/api-keys
 
 Defaults:
-    --model       tiny   (fastest, lowest quality; switch to small/medium/large-v3 for real use)
-    --language    auto-detect
-    --output-dir  ./transcripts
-    --audio-format mp3
+    --model         whisper-1   (currently the only Whisper model exposed via the API)
+    --language      auto-detect
+    --output-dir    ./transcripts
+    --audio-format  mp3
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 # Defaults that match the rest of the project conventions.
-DEFAULT_MODEL = "tiny"
+DEFAULT_MODEL = "whisper-1"
 DEFAULT_OUTPUT_DIR = Path("./transcripts")
 DEFAULT_AUDIO_FORMAT = "mp3"
+
+# OpenAI Whisper API hard limit: https://platform.openai.com/docs/api-reference/audio/createTranscription
+OPENAI_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
 @dataclass
@@ -94,8 +98,7 @@ def download_audio(url: str, output_dir: Path, audio_format: str) -> Path:
             f"yt-dlp failed for {url}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
-    # yt-dlp writes <filename>.<ext>; we know the ext is our audio_format unless
-    # the source had no transcode-able audio stream (rare). Find the freshest file.
+    # yt-dlp writes  a file per video. Pick the most recently modified one.
     candidates = sorted(
         output_dir.glob("*"),
         key=lambda p: p.stat().st_mtime,
@@ -107,51 +110,99 @@ def download_audio(url: str, output_dir: Path, audio_format: str) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# faster-whisper integration
+# OpenAI Whisper API integration
 # --------------------------------------------------------------------------- #
+def _require_openai_client():
+    """
+    Lazily import the `openai` SDK so `--help` and `--skip-transcribe` still run
+    instantly without pulling in the dependency.
+    """
+    try:
+        import openai  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "The `openai` Python package is not installed. "
+            "Install it into the project venv:\n"
+            "  python3 -m venv .venv && .venv/bin/pip install openai"
+        ) from exc
+    return openai
+
+
+def _require_api_key() -> str:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Export it before running:\n"
+            "  export OPENAI_API_KEY='sk-...'\n"
+            "Create one at https://platform.openai.com/api-keys"
+        )
+    return key
+
+
 def transcribe_audio(
     audio_path: Path,
     model_name: str,
     language: str | None,
 ) -> tuple[list[TranscriptSegment], dict]:
     """
-    Transcribe `audio_path` with faster-whisper.
+    Transcribe `audio_path` via the OpenAI Whisper API.
 
-    Returns (segments, info) where info carries detected language and duration.
+    Returns (segments, info) where info carries detected language and duration
+    in the same shape the faster-whisper path used to return, so downstream
+    code (output writers) does not have to know which backend ran.
     """
-    # Imported lazily so --skip-transcribe / --help stay fast and don't drag
-    # torch/ctranslate2 in if the user only wants to download.
-    from faster_whisper import WhisperModel
+    # 1. File-size guard — the API rejects anything > 25 MB.
+    size = audio_path.stat().st_size
+    if size > OPENAI_MAX_UPLOAD_BYTES:
+        mb = size / 1024 / 1024
+        raise RuntimeError(
+            f"{audio_path.name} is {mb:.1f} MB, which exceeds the OpenAI Whisper API's "
+            f"25 MB upload limit. Re-download with a lower bitrate, e.g.:\n"
+            f"  yt-dlp -x --audio-format mp3 --audio-quality 9 -o '%(id)s.%(ext)s' <url>\n"
+            f"or split the file locally with ffmpeg before retrying."
+        )
+
+    openai = _require_openai_client()
+    api_key = _require_api_key()
+
+    # 2. Build the client. Constructing inside the function lets `--help` and
+    #    `--skip-transcribe` run without an OPENAI_API_KEY at all.
+    client = openai.OpenAI(api_key=api_key)
 
     print(
-        f"[whisper] loading model={model_name!r} (device=cpu, compute=int8) ...",
+        f"[whisper-api] uploading {audio_path.name} ({size/1024/1024:.1f} MB) "
+        f"model={model_name!r}",
         file=sys.stderr,
     )
-    # int8 keeps it usable on plain CPU. If you have a GPU, swap to
-    # device="cuda", compute_type="float16".
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
-    print(f"[whisper] transcribing {audio_path.name} ...", file=sys.stderr)
-    segments_iter, info = model.transcribe(
-        str(audio_path),
-        language=language,             # None = auto-detect
-        vad_filter=True,               # skip silent stretches -> cleaner output
-        beam_size=5,
-    )
+    # 3. Call the API. verbose_json + segment granularities gives us per-segment
+    #    timestamps identical in shape to faster-whisper's output.
+    with audio_path.open("rb") as fh:
+        response = client.audio.transcriptions.create(
+            model=model_name,
+            file=(audio_path.name, fh),
+            language=language,                              # None => auto-detect
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
 
+    # `response` is an openai.types.audio.TranscriptionVerbose; access as model
+    # because pydantic models don't behave like dicts in older stubs.
+    raw_segments = getattr(response, "segments", None) or []
     segments = [
-        TranscriptSegment(start=s.start, end=s.end, text=s.text.strip())
-        for s in segments_iter
+        TranscriptSegment(start=float(s.start), end=float(s.end), text=s.text.strip())
+        for s in raw_segments
     ]
+
     meta = {
-        "language": info.language,
-        "language_probability": float(info.language_probability),
-        "duration": float(info.duration),
+        "language": getattr(response, "language", None),
+        "language_probability": None,  # API does not expose this; field kept for shape compat
+        "duration": float(getattr(response, "duration", 0.0) or 0.0),
     }
+
     print(
-        f"[whisper] done: language={meta['language']} "
-        f"p={meta['language_probability']:.2f} duration={meta['duration']:.1f}s "
-        f"segments={len(segments)}",
+        f"[whisper-api] done: language={meta['language']} "
+        f"duration={meta['duration']:.1f}s segments={len(segments)}",
         file=sys.stderr,
     )
     return segments, meta
@@ -237,7 +288,10 @@ def process_local_file(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Download a YouTube video's audio (yt-dlp) and transcribe it (faster-whisper).",
+        description=(
+            "Download a YouTube URL's audio (yt-dlp) and transcribe it via "
+            "the OpenAI Whisper API. Requires OPENAI_API_KEY in the environment."
+        ),
     )
     p.add_argument(
         "urls",
@@ -259,8 +313,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model",
         default=DEFAULT_MODEL,
         help=(
-            "faster-whisper model name (tiny, base, small, medium, large-v3, "
-            "distil-large-v3). Larger = better & slower. Default: %(default)s"
+            "OpenAI Whisper model name. As of 2026 the public API exposes only "
+            "`whisper-1`. Kept as a flag so a future model slug just works. "
+            "Default: %(default)s"
         ),
     )
     p.add_argument(
@@ -271,7 +326,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--audio-format",
         default=DEFAULT_AUDIO_FORMAT,
-        help=f"yt-dlp audio format (mp3, m4a, wav, opus, ...). Default: %(default)s",
+        help=(
+            "yt-dlp audio format (mp3, m4a, wav, opus, ...). Use mp3 + low "
+            "bitrate to stay under the 25 MB API limit. Default: %(default)s"
+        ),
     )
     p.add_argument(
         "--skip-transcribe",
